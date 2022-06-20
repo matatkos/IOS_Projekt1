@@ -1,0 +1,710 @@
+#!/bin/bash
+
+export POSIXLY_CORRECT=yes
+
+print_help()
+{
+  echo "Usage: corona [-h]"
+  echo "       corona [-h] [FILTERS...] [COMMAND] [LOG...]"
+  echo "COMMANDS:"
+  echo "infected    : spočítá počet nakažených"
+  echo "merge       : sloučí několik souborů se záznamy do jednoho, zachovávající původní pořadí"
+  echo "gender      : vypíše počet nakažených pro jednotlivá pohlav"
+  echo "age         : vypíše statistiku počtu nakažených osob dle věku"
+  echo "daily       : vypíše statistiku nakažených osob pro jednotlivé dny"
+  echo "monthly     : vypíše statistiku nakažených osob pro jednotlivé měsíce"
+  echo "yearly      : vypíše statistiku nakažených osob pro jednotlivé roky"
+  echo "countries   : vypíše statistiku nakažených osob pro jednotlivé země nákazy"
+  echo "ditricts    : vypíše statistiku nakažených osob pro jednotlivé okresy"
+  echo "regions     : vypíše statistiku nakažených osob pro jednotlivé kraje"
+  echo "FILTERS:"
+  echo "-a DATETIME : after - jsou uvažovány pouze záznamy PO tomto datu (včetně tohoto data). DATETIME je formátu YYYY-MM-DD"
+  echo "-b DATETIME : before - jsou uvažovány pouze záznamy PŘED tomto datu (včetně tohoto data). DATETIME je formátu YYYY-MM-DD"
+  echo "-g GENDER   : jsou uvažovány pouze záznamy nakažených osob daného pohlaví. GENDER může být M (muži) nebo Z (ženy)"
+  echo "-s [WIDTH]  : u příkazů gender, age, daily, monthly, yearly, countries, districts a regions vypisuje data ne číselně, ale graficky v podobě histogramů "
+  echo "-h          : vypíše nápovědu s krátkým popisem každého příkazu a přepínače"
+}
+
+COMMAND=""
+COMMAND_COUNTER=0
+B_C=0
+A_C=0
+G_C=0
+W_C=0
+
+
+
+###############################################
+#Preberanie argumentov
+for ARGS in "$@"
+do
+  case $ARGS in
+  #Ulazanie commandov
+  infected | merge | gender | age | daily | monthly | yearly | countries | districts | regions)
+    COMMAND="$1"
+    shift
+    COMMAND_COUNTER=$((COMMAND_COUNTER+1))
+    if [ $COMMAND_COUNTER -gt 1 ]; then
+        echo "Too many commands"
+        exit 0
+    fi
+    ;;
+  #Help
+  -h)
+    print_help
+    exit 0
+    ;;
+  #Filter before-date
+  -b)
+    BEFORE_DATETIME="$2"
+    shift
+    B_C=$((B_C+1))
+        if [ $B_C -gt 1 ]; then
+            echo "Used same filter too many times"
+            exit 0
+        fi
+    ;;
+  #filte after-date
+  -a)
+    AFTER_DATETIME="$2"
+    shift
+    A_C=$((A_C+1))
+        if [ $A_C -gt 1 ]; then
+            echo "Used same filter too many times"
+            exit 0
+        fi
+    ;;
+  #filter gender
+  -g)
+    GENDER="$2"
+    shift
+
+    G_C=$((G_C+1))
+        if [ $G_C -gt 1 ]; then
+            echo "Used same filter too many times"
+            exit 0
+        fi
+    ;;
+  #filter width
+  -s)
+    WIDTH="$2"
+    shift
+    W_C=$((W_C+1))
+        if [ $W_C -gt 1 ]; then
+            echo "Used same filter too many times"
+            exit 0
+        fi
+    ;;
+  #ulazanie suborov
+  *)
+    if [[ "$1" =~ .csv ]] || [[ "$1" =~ .csv.gz ]] || [[ "$1" =~ .csv.bz2 ]];then
+    	TEMP_FILES+=("$1")
+    fi
+    shift
+  esac
+done
+
+###############################
+#Preberanie zo stdin
+STDINTIME=0
+if [ "$TEMP_FILES" = "" ];then
+	while read line;do
+		if [ -z "$FILES" ];then
+			FILES+="$(printf "%s\n" "$line")"
+		else
+			FILES+="$(printf "%s\n%s" "$stIn" "$line")"
+		fi
+	done < "${1:-/dev/stdin}"
+	STDINTIME=1
+fi
+
+#####################################
+#Catovanie suborov do jedneho subora
+if [ $STDINTIME = 0 ]; then
+
+  COUNTER=0
+  FILES=""
+  [[ ${#TEMP_FILES[@]} -eq 0 ]] ||
+    for file in "${TEMP_FILES[@]}";do
+      if [ $COUNTER = 0 ]; then
+        ((COUNTER++))
+        if [[ "$file" =~ .csv.gz ]];then
+          s="$(gunzip -c "$file")"
+        elif [[ "$file" =~ .csv.bz2 ]]; then
+          s="$(bzcat "$file")"
+        else
+          s="$(cat "$file")"
+        fi
+        [[ -z "$FILES" ]] && FILES="$(printf "%s\n" "$s")" ||
+          FILES="$(printf "%s\n%s" "$FILES" "$s")"
+      else
+        if [[ "$file" =~ .gz ]];then
+          if [ "$COUNTER" = 0 ]; then
+            s="$(gunzip -c "$file")"
+            ((COUNTER++))
+          else
+            s="$(gunzip -c "$file" | awk '(NR>1)')"
+          fi
+        elif [[ "$file" =~ .cvs.bz2 ]]; then
+          if [ "$COUNTER" = 0 ]; then
+            s="$(bzcat "$file")"
+            ((COUNTER++))
+          else
+            s="$(bzcat "$file" | awk '(NR>1)')"
+          fi
+        else
+          if [ "$COUNTER" = 0 ]; then
+            s="$(cat "$file")"
+          else
+            s="$(cat "$file" | awk '(NR>1)')"
+          fi
+        fi
+        #Danie vsetkych suborov do jednej premennej
+        [[ -z "$FILES" ]] && FILES="$(printf "%s\n" "$s")" ||
+          FILES="$(printf "%s\n%s" "$FILES" "$s")"
+      fi
+    done
+fi
+########################################
+#Kontrola datumu
+
+function isYYYYMMDDdate() {
+  local FILE=$1
+  DATES=$(echo "$FILE" | awk -F, '{print $2}')
+  index1=1
+  while IFS= read -r dates
+  do
+    len=${#dates}
+    #Kontrola ci je datum v platnom formate alebo ci tam je len prazdne miesto
+    if [ "$len" = 10 ] || [ "$dates" = "" ]; then
+      d=${dates:8:2}; m=${dates:5:2}; Y=${dates:0:4}; if date -d "$Y-$m-$d" &> /dev/null; then VALID=0;
+      elif [ "$dates" = "" ]; then
+        VALID=0
+      else VALID=1; fi
+    else
+      VALID=1
+    fi
+    #Ulazanie riadkov so spravnym datumom, zla datumy budu dane do stderr
+    if [ $VALID = 0 ];then
+      local FINAL[index1]=$(echo "$FILE" | awk -v i=$index1 -F, '{if(NR==i) print $0}')
+    elif [ $VALID = 1 ]; then
+      echo "$FILE" | awk -v D=$dates -F, '{if($2==D)print "Invalid date: "$0 > "/dev/stderr"}'
+    fi
+    ((index1++))
+  done <<< "$DATES"
+  FINAL[0]="id,datum,vek,pohlavi,kraj_nuts_kod,okres_lau_kod,nakaza_v_zahranici,nakaza_zeme_csu_kod,reportovano_khs"
+  for dinks in "${FINAL[@]}";do
+    FILELE+="$dinks"$'\n'
+  done
+}
+
+#############################################
+#Odstranenie prazdnych linov
+FILES=$(echo "$FILES" | grep "\S")
+#Odstranenie medzier
+FILES=$(echo "$FILES" | awk '{ gsub(/ /,""); print }')
+#Kontrolova veku
+echo "$FILES" | awk -F, 'NR>1{if($3 != ""){if(($3 ~ /^[0-9]+$/)){}else print "Invalid age: " $0 >"/dev/stderr"}}'
+FILES=$(echo "$FILES" | awk -F, '{if($3 != ""){if(!($3 ~ /^[0-9]+$/)){}else print $0}else print $0}')
+#Kontrola datumu
+
+isYYYYMMDDdate "$FILES"
+FILES=$FILELE
+FILES=$(echo "$FILES" | grep "\S")
+
+
+###############################################
+#Osetrenie filtrov
+
+#GENDER FILTER
+if [ "$GENDER" = "M" ] || [ "$GENDER" = "Z" ]; then
+  FILES=$(echo "$FILES" | awk -v G="$GENDER" -F, '{if(($4==G) || (NR==1))print $0}')
+
+#AFTER_DATE FILTER
+elif [ $A_C = 1 ] || [ $B_C = 1 ]; then
+  if [ $B_C = 0 ]; then
+    BEFORE_DATETIME="9999-12-31"
+  elif [ $A_C = 0 ]; then
+    AFTER_DATETIME="0000-00-00"
+  fi
+  FILES=$(echo "$FILES" | awk -F ',' -v after="$AFTER_DATETIME" -v before="$BEFORE_DATETIME" '{if((after<=$2 && before >=$2) || (NR==1) || ($2=="")) print $0}')
+fi
+
+
+####################################
+#Funkcia na pocitanie nakazanenych
+
+function line_counter()
+{
+  LINES=0
+  var=$(echo "$1" | wc -l )
+  LINES=$((LINES+var))
+  ((LINES--))
+  echo "$LINES"
+}
+
+####################################
+#Funkcia na pocet podla pohlavia
+
+function gender()
+{
+  MEN=$(echo "$1" | awk -F, '{A[$4]+=1} END{print A["M"]}')
+  WOMEN=$(echo "$1" | awk -F, '{A[$4]+=1} END{print A["Z"]}')
+  NON=$(echo "$1" | awk -F, '{A[$4]+=1} END{print A[""]}')
+  #Ak je nastaveny width
+  if [ $W_C = 1 ]; then
+    MEN=$(echo "$MEN" | awk '{printf "%d",(($1+50000)/100000)}')
+
+    for (( i = 0; i < "$MEN"; i++ )); do
+      MEN_HASHES+="#"
+    done
+
+    WOMEN=$(echo "$WOMEN" | awk '{printf "%d",(($1+50000)/100000)}')
+    for (( i = 0; i < "$WOMEN"; i++ )); do
+      WOMEN_HASHES+="#"
+    done
+
+    NON=$(echo "$NON" | awk '{printf "%d",(($1+50000)/100000)}')
+    for (( i = 0; i < "$NON"; i++ )); do
+      NONE_HASHES+="#"
+    done
+
+    echo "M: $MEN_HASHES"
+    echo "Z: $WOMEN_HASHES"
+    echo "N: $NONE_HASHES"
+  #Ak nie je width nastaveny
+  else
+    echo "$MEN" | awk '{if(length($0)!=0)print "M:",$0}'
+    echo "$WOMEN" | awk '{if(length($0)!=0)print "Z:",$0}'
+    echo "$NON" | awk '{if(length($0)!=0)print "N:",$0}'
+  fi
+}
+
+#############################################
+#Funkcia na statistiky podla veku
+function age()
+{
+  #Ulozenie poctov jednotlivych vekov do pola
+  A[1]=$(echo "$1" | awk -F, 'NR>1{if($3>=0 && $3<=5)counter++} END{print counter}')
+  A[2]=$(echo "$1" | awk -F, 'NR>1{if($3>=6 && $3<=15)counter++} END{print counter}')
+  A[3]=$(echo "$1" | awk -F, 'NR>1{if($3>=16 && $3<=25)counter++} END{print counter}')
+  A[4]=$(echo "$1" | awk -F, 'NR>1{if($3>=26 && $3<=35)counter++} END{print counter}')
+  A[5]=$(echo "$1" | awk -F, 'NR>1{if($3>=36 && $3<=45)counter++} END{print counter}')
+  A[6]=$(echo "$1" | awk -F, 'NR>1{if($3>=46 && $3<=55)counter++} END{print counter}')
+  A[7]=$(echo "$1" | awk -F, 'NR>1{if($3>=56 && $3<=65)counter++} END{print counter}')
+  A[8]=$(echo "$1" | awk -F, 'NR>1{if($3>=66 && $3<=75)counter++} END{print counter}')
+  A[9]=$(echo "$1" | awk -F, 'NR>1{if($3>=76 && $3<=85)counter++} END{print counter}')
+  A[10]=$(echo "$1" | awk -F, 'NR>1{if($3>=86 && $3<=95)counter++} END{print counter}')
+  A[11]=$(echo "$1" | awk -F, 'NR>1{if($3>=96 && $3<=105)counter++} END{print counter}')
+  A[12]=$(echo "$1" | awk -F, 'NR>1{if($3>105)counter++} END{print counter}')
+
+  local NUMBER=0
+  PRVE=6
+  DRUHE=15
+
+  if [ $W_C = 1 ]; then
+
+    for (( i = 1; i < 13; i++ )); do
+      NUMBER=$(echo "${A[i]}" | awk '{printf "%d",(($1+5000)/10000)}')
+      for (( j = 0; j < "$NUMBER"; j++ )); do
+        HASHES+="#"
+      done
+
+      if [ "$i" = 1 ]; then
+        echo "${A[i]}" | awk -v H=$HASHES '{if(length($0)!=0)print "0 - 5:  " H}'
+      elif [ "$i" = 12 ]; then
+        echo "${A[i]}" | awk -v H=$HASHES '{if(length($0)!=0)print "105>:" H}'
+      else
+        echo "${A[i]}" | awk -v P=$PRVE -v D=$DRUHE -v H=$HASHES '{if(length($0)!=0)print P " - " D ":  " H}'
+        PRVE=$((PRVE+10))
+        DRUHE=$((DRUHE+10))
+      fi
+      HASHES=""
+    done
+
+    NON=$(echo "$1" | awk -F, '{A[$3]+=1} END{print A[""]}')
+    NUMBER=$(echo "$NON" | awk '{printf "%d",(($1+5000)/10000)}')
+
+    for (( j = 0; j < "$NUMBER"; j++ )); do
+      HASHES+="#"
+    done
+
+    if [ "$HASHES" != "" ]; then
+      echo "NONE: $HASHES"
+    fi
+  else
+    for (( i = 1; i < 13; i++ )); do
+        if [ "$i" = 1 ]; then
+          echo "${A[i]}" | awk '{if(length($0)!=0)print "0 - 5:  ",$0}'
+        elif [ "$i" = 12 ]; then
+          echo "${A[i]}" | awk '{if(length($0)!=0)print "->105:",$0}'
+        else
+          echo "${A[i]}" | awk -v P=$PRVE -v D=$DRUHE '{if(length($0)!=0)print P " - " D " : " $0}'
+          PRVE=$((PRVE+10))
+          DRUHE=$((DRUHE+10))
+        fi
+    done
+
+    NON=$(echo "$1" | awk -F, '{A[$3]+=1} END{print A[""]}')
+    echo "$NON" | awk '{if(length($0)!=0)print "NONE:",$0}'
+  fi
+}
+
+
+#########################################
+#Funkcia na spocitanie poctu nakazenych v jednotlive dni
+function daily()
+{
+  local FILE=$1
+  DATUMY=$(echo "$FILE" | awk -F, 'NR>1{a[$2]++} END{for(b in a) print b}')
+  UNIQ_DATES=""
+  INDEX=0
+
+  while IFS= read -r line
+  do
+    if [ "$line" != "" ]; then
+      UNIQ_DATES[INDEX]=$line
+      ((INDEX++))
+    fi
+  done <<< "$DATUMY"
+
+  for date in "${UNIQ_DATES[@]}";do
+    FOUND=$(echo "$FILE" | awk -v D="$date" -F, '{A[$2]+=1} END{print A[D]}')
+
+    if [ $W_C = 1 ]; then
+      NUMBER=$(echo "$FOUND" | awk '{printf "%d",(($1+250)/500)}')
+      for (( j = 0; j < "$NUMBER"; j++ )); do
+        HASHES+="#"
+      done
+      if [ "$HASHES" != "" ]; then
+        echo "$date: $HASHES"
+      fi
+      HASHES=""
+    else
+    echo "$date: $FOUND"
+    fi
+  done
+
+  if [ $W_C = 1 ]; then
+    NON=$(echo "$1" | awk -F, '{A[$2]+=1} END{print A[""]}')
+    NUMBER=$(echo "$NON" | awk '{printf "%d",(($1+250)/500)}')
+
+    for (( j = 0; j < "$NUMBER"; j++ )); do
+      HASHES+="#"
+    done
+
+    if [ "$HASHES" != "" ]; then
+      echo "NONE: $HASHES"
+    fi
+  else
+    NON=$(echo "$1" | awk -F, '{A[$2]+=1} END{print A[""]}')
+    echo "$NON" | awk '{if(length($0)!=0)print "NONE:",$0}'
+  fi
+}
+
+#############################
+#Pocet nakazenych v jednotlivych mesiacoch
+function monthly()
+{
+  local FILE=$1
+  UNIQ_DATES=""
+
+  INDEX=0
+  DATUMY=$(echo "$FILE" | awk -F, 'NR>1{print $2}')
+
+  while IFS= read -r line
+  do
+    if [ "$line" != "" ]; then
+      UNIQ_DATES[INDEX]=${line::-3}
+      ((INDEX++))
+    fi
+  done <<< "$DATUMY"
+
+  SORTED_UNIQ_DATES=$(printf "%s\n" "${UNIQ_DATES[@]}" | sort -u)
+
+  while IFS= read -r line;do
+    counter=0
+    for date in "${UNIQ_DATES[@]}";do
+      if [ "$line" = "$date" ]; then
+        ((counter++))
+      fi
+    done
+    if [ $W_C = 1 ]; then
+      counter=$(((counter+5000)/10000))
+      for (( j = 0; j < "$counter"; j++ )); do
+        HASHES+="#"
+      done
+      if [ "$HASHES" != "" ]; then
+        echo "$date: $HASHES"
+      fi
+      HASHES=""
+    else
+      echo "$line: $counter"
+    fi
+  done <<< "$SORTED_UNIQ_DATES"
+  if [ $W_C = 1 ]; then
+    NON=$(echo "$1" | awk -F, '{A[$2]+=1} END{print A[""]}')
+    NUMBER=$(echo "$NON" | awk '{printf "%d",(($1+5000)/10000)}')
+
+    for (( j = 0; j < "$NUMBER"; j++ )); do
+      HASHES+="#"
+    done
+
+    if [ "$HASHES" != "" ]; then
+      echo "NONE: $HASHES"
+    fi
+  else
+    NON=$(echo "$1" | awk -F, '{A[$2]+=1} END{print A[""]}')
+    echo "$NON" | awk '{if(length($0)!=0)print "NONE:",$0}'
+  fi
+}
+
+###################################
+#Pocet nakazenych v jednotlivych rokoch
+function yearly()
+{
+  local FILE=$1
+  UNIQ_DATES=""
+
+  INDEX=0
+
+  DATUMY=$(echo "$FILE" | awk -F, 'NR>1{print $2}')
+  while IFS= read -r line
+  do
+    if [ "$line" != "" ]; then
+      UNIQ_DATES[INDEX]=${line::-6}
+      ((INDEX++))
+    fi
+  done <<< "$DATUMY"
+
+  local SORTED_UNIQ_DATES=$(printf "%s\n" "${UNIQ_DATES[@]}" | sort -u)
+
+  while IFS= read -r line;do
+    counter=0
+    for date in "${UNIQ_DATES[@]}";do
+      if [ "$line" = "$date" ]; then
+        ((counter++))
+      fi
+    done
+    if [ $W_C = 1 ]; then
+      counter=$(((counter+50000)/100000))
+      for (( j = 0; j < "$counter"; j++ )); do
+        HASHES+="#"
+      done
+      if [ "$HASHES" != "" ]; then
+        echo "$date: $HASHES"
+      fi
+      HASHES=""
+    else
+      echo "$line: $counter"
+    fi
+  done <<< "$SORTED_UNIQ_DATES"
+
+  if [ $W_C = 1 ]; then
+    NON=$(echo "$1" | awk -F, '{A[$2]+=1} END{print A[""]}')
+    NUMBER=$(echo "$NON" | awk '{printf "%d",(($1+50000)/100000)}')
+
+    for (( j = 0; j < "$NUMBER"; j++ )); do
+      HASHES+="#"
+    done
+
+    if [ "$HASHES" != "" ]; then
+      echo "NONE: $HASHES"
+    fi
+  else
+    NON=$(echo "$1" | awk -F, '{A[$2]+=1} END{print A[""]}')
+    echo "$NON" | awk '{if(length($0)!=0)print "NONE:",$0}'
+  fi
+}
+
+################################################
+#Pocet nakazenych v krajine
+function countries()
+{
+  local FILE=$1
+  COUNTRIES=""
+  TEMP=$(echo "$FILE" | awk -F, 'NR>1{print $8}')
+  TEMP=$(echo "$TEMP" | grep "\S")
+  while IFS= read -r line
+    do
+    COUNTRIES[INDEX]=$(echo "$line" | xargs)
+    ((INDEX++))
+  done <<< "$TEMP"
+  SORTED_COUNTRIES=$(printf "%s\n" "${COUNTRIES[@]}" | sort -u)
+
+
+  while IFS= read -r line;do
+    counter=0
+    for date in "${COUNTRIES[@]}";do
+      if [ "$line" = "$date" ]; then
+        ((counter++))
+      fi
+    done
+    if [ $W_C = 1 ]; then
+      counter=$(((counter+50)/100))
+      for (( i = 0; i < "$counter"; i++ )); do
+         HASHES+="#"
+      done
+      if [ "$HASHES" != "" ]; then
+         echo "$line: $HASHES"
+      fi
+      HASHES=""
+    else
+      echo "$line: $counter"
+    fi
+  done <<< "$SORTED_COUNTRIES"
+}
+
+#################################
+#Pocet nakazenych v okresoch
+function districts()
+{
+  local FILE=$1
+  OKRESY=""
+  TEMP=$(echo "$FILE" | awk -F, 'NR>1{print $6}')
+  INDEX=0
+  while IFS= read -r line
+    do
+    if [ "$line" != "" ]; then
+      OKRESY[INDEX]=${line}
+      ((INDEX++))
+    fi
+  done <<< "$TEMP"
+
+  SORTED_OKRESY=$(printf "%s\n" "${OKRESY[@]}" | sort -u)
+
+
+  while IFS= read -r line;do
+    counter=0
+    for date in "${OKRESY[@]}";do
+      if [ "$line" = "$date" ]; then
+        ((counter++))
+      fi
+    done
+    if [ $W_C = 1 ]; then
+      counter=$(((counter+500)/1000))
+      for (( i = 0; i < "$counter"; i++ )); do
+         HASHES+="#"
+      done
+      if [ "$HASHES" != "" ]; then
+         echo "$line: $HASHES"
+      fi
+      HASHES=""
+    else
+      echo "$line: $counter"
+    fi
+  done <<< "$SORTED_OKRESY"
+  if [ $W_C = 1 ]; then
+    NON=$(echo "$1" | awk -F, '{A[$6]+=1} END{print A[""]}')
+    NUMBER=$(echo "$NON" | awk '{printf "%d",(($1+500)/1000)}')
+
+    for (( j = 0; j < "$NUMBER"; j++ )); do
+      HASHES+="#"
+    done
+
+    if [ "$HASHES" != "" ]; then
+      echo "NONE: $HASHES"
+    fi
+  else
+    NON=$(echo "$1" | awk -F, '{A[$6]+=1} END{print A[""]}')
+    echo "$NON" | awk '{if(length($0)!=0)print "NONE:",$0}'
+  fi
+
+}
+
+#################################
+#Pocet nakazenych v krajoch
+function regions()
+{
+  local FILE=$1
+  KRAJE=""
+  TEMP=$(echo "$FILE" | awk -F, 'NR>1{print $5}')
+  INDEX=0
+  while IFS= read -r line
+  do
+    if [ "$line" != "" ]; then
+      KRAJE[INDEX]=${line:2}
+      ((INDEX++))
+    fi
+  done <<< "$TEMP"
+
+  SORTED_KRAJE=$(printf "%s\n" "${KRAJE[@]}" | sort -u)
+
+
+  while IFS= read -r line;do
+    counter=0
+    for date in "${KRAJE[@]}";do
+      if [ "$line" = "$date" ]; then
+        ((counter++))
+      fi
+    done
+    if [ $W_C = 1 ]; then
+      counter=$(((counter+5000)/10000))
+      for (( i = 0; i < "$counter"; i++ )); do
+         HASHES+="#"
+      done
+      if [ "$HASHES" != "" ]; then
+         echo "$line: $HASHES"
+      fi
+      HASHES=""
+    else
+      echo "$line: $counter"
+    fi
+  done <<< "$SORTED_KRAJE"
+  if [ $W_C = 1 ]; then
+    NON=$(echo "$1" | awk -F, '{A[$5]+=1} END{print A[""]}')
+    NUMBER=$(echo "$NON" | awk '{printf "%d",(($1+5000)/10000)}')
+
+    for (( j = 0; j < "$NUMBER"; j++ )); do
+      HASHES+="#"
+    done
+
+    if [ "$HASHES" != "" ]; then
+      echo "NONE: $HASHES"
+    fi
+  else
+    NON=$(echo "$1" | awk -F, '{A[$5]+=1} END{print A[""]}')
+    echo "$NON" | awk '{if(length($0)!=0)print "NONE:",$0}'
+  fi
+}
+
+
+#################################
+#Prechadzanie prebratych COMMANDS
+case $COMMAND in
+  infected)
+    line_counter "${FILES[@]}"
+    ;;
+  gender)
+    gender "${FILES[@]}"
+    ;;
+  age)
+    age "${FILES[@]}"
+    ;;
+  daily)
+    daily "${FILES[@]}"
+    ;;
+  monthly)
+    monthly "${FILES[@]}"
+    ;;
+  yearly)
+    yearly "${FILES[@]}"
+    ;;
+  countries)
+    countries "${FILES[@]}"
+    ;;
+  districts)
+    districts "${FILES[@]}"
+    ;;
+  regions)
+    regions "${FILES[@]}"
+    ;;
+  merge)
+    echo "${FILES[@]}"
+esac
+
+##########################
+#Ak nedostaneme command a len subor-vypisovanie suboru
+if [ "$COMMAND" = "" ]; then
+  echo "$FILES"
+fi
